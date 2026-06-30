@@ -93,19 +93,28 @@ jobs:
             (cd "$APPLE_DIR" && xcodegen generate)
           fi
 
-          # 3) 清空原作者写死的团队 ID，签名身份改成 ad-hoc（"-"）
+          # 3) 清空原作者写死的团队 ID，签名身份改成空（不签名）
+          #    注意：不能用 "-"（ad-hoc），iOS 18.5 SDK 不允许 ad-hoc 签名。
+          #    改成空字符串 + CODE_SIGNING_ALLOWED=NO 才能跳过签名。
           if [ -f "$PBX" ]; then
             echo "--- Before patch: signing settings ---"
-            grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY' "$PBX" || true
+            grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY|CODE_SIGNING_ALLOWED' "$PBX" || true
 
+            # 把 CODE_SIGN_IDENTITY 的值清空（不管原来是什么）
             sed -i '' \
               -e 's/DEVELOPMENT_TEAM = "[^"]*";/DEVELOPMENT_TEAM = "";/g' \
-              -e 's/CODE_SIGN_IDENTITY = "iPhone Developer";/CODE_SIGN_IDENTITY = "-";/g' \
-              -e 's/CODE_SIGN_IDENTITY = "iOS Development";/CODE_SIGN_IDENTITY = "-";/g' \
+              -e 's/CODE_SIGN_IDENTITY = "[^"]*";/CODE_SIGN_IDENTITY = "";/g' \
+              -e 's/CODE_SIGN_IDENTITY = [^;]*;/CODE_SIGN_IDENTITY = "";/g' \
               "$PBX"
 
+            # 给每个 build configuration 加上 CODE_SIGNING_ALLOWED = NO
+            # 通过在 ASSETCATALOG_COMPILER_APPICON_NAME 行后插入
+            if ! grep -q 'CODE_SIGNING_ALLOWED' "$PBX"; then
+              sed -i '' 's/ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;/ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO;/g' "$PBX"
+            fi
+
             echo "--- After patch: signing settings ---"
-            grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY' "$PBX" || true
+            grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY|CODE_SIGNING_ALLOWED' "$PBX" || true
           fi
 
       - name: Build iOS app with tauri (export step may fail, that's OK)
