@@ -108,34 +108,39 @@ jobs:
             grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY' "$PBX" || true
           fi
 
-      - name: Build iOS app with xcodebuild (skip signing)
+      - name: Build iOS app with tauri (export step may fail, that's OK)
         env:
           CODE_SIGNING_ALLOWED: "NO"
           CODE_SIGNING_REQUIRED: "NO"
           CODE_SIGN_IDENTITY: ""
           DEVELOPMENT_TEAM: ""
+          RUST_BACKTRACE: "1"
         run: |
-          set -euo pipefail
-          APPLE_DIR="$GITHUB_WORKSPACE/src-tauri/gen/apple"
-          echo "Building iOS app with xcodebuild..."
-          xcodebuild \
-            -project "$APPLE_DIR/tauritavern.xcodeproj" \
-            -scheme tauritavern_iOS \
-            -sdk iphoneos \
-            -configuration Debug \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$APPLE_DIR/build" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" \
-            ENABLE_BITCODE=NO \
-            ARCHS=arm64 \
-            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" || {
-              echo "=== Build failed ==="
-              tail -100 "$RUNNER_TEMP/xcodebuild.log"
-              exit 1
-            }
+          set +e
+          echo "Building iOS app with tauri ios build..."
+          pnpm exec tauri ios build --debug 2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
+          BUILD_EXIT=$?
+          echo "tauri ios build exit code: $BUILD_EXIT"
+
+          # tauri ios build 分两步：编译 + 导出。
+          # 导出步骤因为没证书会失败，但 .app 已经在 DerivedData 里了。
+          # 只要编译成功，我们就继续往下走去找 .app。
+          echo "=== Searching for built .app regardless of build exit code ==="
+          find "$GITHUB_WORKSPACE/src-tauri/gen/apple" -type d -name "*.app" 2>/dev/null || true
+          find ~/Library/Developer/Xcode/DerivedData -type d -name "TauriTavern.app" 2>/dev/null || true
+
+          # 如果连 .app 都没找到，那才是真的失败
+          APP_CHECK=$(find ~/Library/Developer/Xcode/DerivedData -type d -name "TauriTavern.app" 2>/dev/null | head -n 1)
+          if [ -z "$APP_CHECK" ]; then
+            APP_CHECK=$(find "$GITHUB_WORKSPACE/src-tauri/gen/apple" -type d -name "TauriTavern.app" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$APP_CHECK" ]; then
+            echo "=== ERROR: No .app found, build truly failed ==="
+            tail -100 "$RUNNER_TEMP/tauri-build.log"
+            exit 1
+          fi
+          echo "Found .app at: $APP_CHECK"
+          exit 0
 
       - name: Locate built .app and package as IPA
         id: package
