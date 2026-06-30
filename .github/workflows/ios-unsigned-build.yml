@@ -108,7 +108,7 @@ jobs:
             grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY' "$PBX" || true
           fi
 
-      - name: Build iOS app (skip code signing)
+      - name: Build iOS app with xcodebuild (skip signing)
         env:
           CODE_SIGNING_ALLOWED: "NO"
           CODE_SIGNING_REQUIRED: "NO"
@@ -116,17 +116,26 @@ jobs:
           DEVELOPMENT_TEAM: ""
         run: |
           set -euo pipefail
-          echo "Building iOS app..."
-          pnpm exec tauri ios build --debug --no-bundle || {
-            echo "=== Build failed. Checking build logs ==="
-            APPLE_DIR="$GITHUB_WORKSPACE/src-tauri/gen/apple"
-            find "$APPLE_DIR" -name "*.log" -exec echo "--- {} ---" \; -exec tail -50 {} \; || true
-            echo "=== Xcode build dir ==="
-            find "$APPLE_DIR/build" -type f -name "*.log" 2>/dev/null | head -10 || true
-            echo "=== DerivedData ==="
-            find ~/Library/Developer/Xcode/DerivedData -name "*.log" 2>/dev/null | head -10 || true
-            exit 1
-          }
+          APPLE_DIR="$GITHUB_WORKSPACE/src-tauri/gen/apple"
+          echo "Building iOS app with xcodebuild..."
+          xcodebuild \
+            -project "$APPLE_DIR/tauritavern.xcodeproj" \
+            -scheme tauritavern_iOS \
+            -sdk iphoneos \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$APPLE_DIR/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_BITCODE=NO \
+            ARCHS=arm64 \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" || {
+              echo "=== Build failed ==="
+              tail -100 "$RUNNER_TEMP/xcodebuild.log"
+              exit 1
+            }
 
       - name: Locate built .app and package as IPA
         id: package
@@ -144,10 +153,8 @@ jobs:
 
           # 尝试多种路径模式来找到 .app
           APP_PATH=""
-          # 1) 在 gen/apple 的 Debug 目录
+          # 1) xcodebuild 输出路径（-derivedDataPath 指定了 build 目录）
           for candidate in \
-            "$APPLE_DIR/build/Debug-iphoneos/TauriTavern.app" \
-            "$APPLE_DIR/build/Debug/TauriTavern.app" \
             "$APPLE_DIR/build/Build/Products/Debug-iphoneos/TauriTavern.app" \
             "$APPLE_DIR/build/Build/Products/Debug/TauriTavern.app"; do
             if [ -d "$candidate" ]; then
