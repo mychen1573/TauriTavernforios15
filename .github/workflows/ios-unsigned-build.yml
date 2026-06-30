@@ -1,1 +1,138 @@
+name: iOS Unsigned Build (TrollStore)
 
+# 这个 workflow 生成一个未签名（ad-hoc）的 IPA，可用 TrollStore 直接安装。
+# 不需要 Apple Developer 账号、不需要任何证书或 App Store Connect 密钥。
+# 完全使用 GitHub 提供的免费 macOS runner。
+#
+# 用法：
+#   1. Fork 仓库到自己账号（建议公开仓库，Actions 免费无限制）
+#   2. 进入 Actions 标签页，选择 "iOS Unsigned Build (TrollStore)"
+#   3. 点击 "Run workflow" 手动触发
+#   4. 构建完成后，在运行结果里下载 artifact "TauriTavern-ios15-unsigned-ipa"
+#   5. 解压得到 .ipa，用 TrollStore 安装
+
+on:
+  push:
+    branches:
+      - docs-refresh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios-unsigned:
+    runs-on: macos-latest
+    name: Build unsigned IPA
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - name: Install Rust toolchain (iOS target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend assets
+        run: pnpm run web:build
+
+      # gen/apple 目录被 .gitignore 忽略，必须先 init 生成 Xcode 工程
+      - name: Init Tauri iOS project
+        run: pnpm exec tauri ios init
+
+      - name: Patch iOS deployment target and signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPLE_DIR="$GITHUB_WORKSPACE/src-tauri/gen/apple"
+          PROJ_YML="$APPLE_DIR/project.yml"
+          PBX="$APPLE_DIR/tauritavern.xcodeproj/project.pbxproj"
+
+          # 1) 部署目标改为 iOS 15.0（兼容 iOS 15 系统）
+          if [ -f "$PROJ_YML" ]; then
+            sed -i '' -E 's/(iOS: *)[0-9]+\.[0-9]+/\115.0/g' "$PROJ_YML"
+            echo "--- project.yml deploymentTarget ---"
+            grep -nE 'deploymentTarget|iOS' "$PROJ_YML" || true
+          fi
+
+          # 2) 重新生成 .xcodeproj（project.yml 是 XcodeGen 的源）
+          if command -v xcodegen >/dev/null 2>&1; then
+            (cd "$APPLE_DIR" && xcodegen generate) || true
+          fi
+
+          # 3) 清空原作者写死的团队 ID，签名身份改成 ad-hoc（"-"）
+          if [ -f "$PBX" ]; then
+            sed -i '' \
+              -e 's/DEVELOPMENT_TEAM = "[^"]*";/DEVELOPMENT_TEAM = "";/g' \
+              -e 's/CODE_SIGN_IDENTITY = "iPhone Developer";/CODE_SIGN_IDENTITY = "-";/g' \
+              -e 's/CODE_SIGN_IDENTITY = "iOS Development";/CODE_SIGN_IDENTITY = "-";/g' \
+              "$PBX"
+            echo "--- patched signing settings ---"
+            grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY' "$PBX" || true
+          fi
+
+      - name: Build iOS app (skip code signing)
+        env:
+          # 构建阶段禁用代码签名，避免在没有证书时失败
+          CODE_SIGNING_ALLOWED: "NO"
+          CODE_SIGNING_REQUIRED: "NO"
+          CODE_SIGN_IDENTITY: ""
+        run: pnpm exec tauri ios build --debug --no-bundle
+
+      - name: Locate built .app and package as IPA
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPLE_DIR="$GITHUB_WORKSPACE/src-tauri/gen/apple"
+          APP_PATH=$(find "$APPLE_DIR" -type d -name "*.app" -path "*Debug*" | head -n 1)
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "App bundle not found. All .app dirs:"
+            find "$APPLE_DIR" -type d -name "*.app" || true
+            echo "Build products dirs:"
+            find "$APPLE_DIR" -type d -name "Build" -exec find {} -maxdepth 3 -type d \; || true
+            exit 1
+          fi
+          echo "Found app at: $APP_PATH"
+
+          STAGING="$RUNNER_TEMP/ipa-staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING/Payload"
+          cp -R "$APP_PATH" "$STAGING/Payload/"
+
+          # TrollStore 可识别的未签名 IPA（本质是 Payload/*.app 的 zip）
+          IPA="$RUNNER_TEMP/TauriTavern-ios15-unsigned.ipa"
+          rm -f "$IPA"
+          (cd "$STAGING" && zip -r -y "$IPA" Payload > /dev/null)
+
+          echo "ipa_path=$IPA" >> "$GITHUB_OUTPUT"
+          ls -lh "$IPA"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TauriTavern-ios15-unsigned-ipa
+          path: ${{ steps.package.outputs.ipa_path }}
+          if-no-files-found: error
+          retention-days: 30
