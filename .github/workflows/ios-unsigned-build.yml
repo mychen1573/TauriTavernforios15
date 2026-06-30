@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   build-ios-unsigned:
-    runs-on: macos-latest
+    runs-on: macos-15
     name: Build unsigned IPA
 
     steps:
@@ -69,36 +69,64 @@ jobs:
           PROJ_YML="$APPLE_DIR/project.yml"
           PBX="$APPLE_DIR/tauritavern.xcodeproj/project.pbxproj"
 
+          echo "=== Files in gen/apple ==="
+          ls -la "$APPLE_DIR/" || true
+
           # 1) 部署目标改为 iOS 15.0（兼容 iOS 15 系统）
           if [ -f "$PROJ_YML" ]; then
+            echo "--- Before patch: project.yml ---"
+            cat "$PROJ_YML"
             sed -i '' -E 's/(iOS: *)[0-9]+\.[0-9]+/\115.0/g' "$PROJ_YML"
-            echo "--- project.yml deploymentTarget ---"
+            echo "--- After patch: project.yml ---"
             grep -nE 'deploymentTarget|iOS' "$PROJ_YML" || true
+          else
+            echo "WARNING: project.yml not found, will try patching pbxproj directly"
           fi
 
           # 2) 重新生成 .xcodeproj（project.yml 是 XcodeGen 的源）
           if command -v xcodegen >/dev/null 2>&1; then
-            (cd "$APPLE_DIR" && xcodegen generate) || true
+            echo "Running xcodegen..."
+            (cd "$APPLE_DIR" && xcodegen generate)
+          else
+            echo "xcodegen not found, installing..."
+            brew install xcodegen
+            (cd "$APPLE_DIR" && xcodegen generate)
           fi
 
           # 3) 清空原作者写死的团队 ID，签名身份改成 ad-hoc（"-"）
           if [ -f "$PBX" ]; then
+            echo "--- Before patch: signing settings ---"
+            grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY' "$PBX" || true
+
             sed -i '' \
               -e 's/DEVELOPMENT_TEAM = "[^"]*";/DEVELOPMENT_TEAM = "";/g' \
               -e 's/CODE_SIGN_IDENTITY = "iPhone Developer";/CODE_SIGN_IDENTITY = "-";/g' \
               -e 's/CODE_SIGN_IDENTITY = "iOS Development";/CODE_SIGN_IDENTITY = "-";/g' \
               "$PBX"
-            echo "--- patched signing settings ---"
+
+            echo "--- After patch: signing settings ---"
             grep -nE 'DEVELOPMENT_TEAM|CODE_SIGN_IDENTITY' "$PBX" || true
           fi
 
       - name: Build iOS app (skip code signing)
         env:
-          # 构建阶段禁用代码签名，避免在没有证书时失败
           CODE_SIGNING_ALLOWED: "NO"
           CODE_SIGNING_REQUIRED: "NO"
           CODE_SIGN_IDENTITY: ""
-        run: pnpm exec tauri ios build --debug --no-bundle
+          DEVELOPMENT_TEAM: ""
+        run: |
+          set -euo pipefail
+          echo "Building iOS app..."
+          pnpm exec tauri ios build --debug --no-bundle || {
+            echo "=== Build failed. Checking build logs ==="
+            APPLE_DIR="$GITHUB_WORKSPACE/src-tauri/gen/apple"
+            find "$APPLE_DIR" -name "*.log" -exec echo "--- {} ---" \; -exec tail -50 {} \; || true
+            echo "=== Xcode build dir ==="
+            find "$APPLE_DIR/build" -type f -name "*.log" 2>/dev/null | head -10 || true
+            echo "=== DerivedData ==="
+            find ~/Library/Developer/Xcode/DerivedData -name "*.log" 2>/dev/null | head -10 || true
+            exit 1
+          }
 
       - name: Locate built .app and package as IPA
         id: package
@@ -106,14 +134,43 @@ jobs:
         run: |
           set -euo pipefail
           APPLE_DIR="$GITHUB_WORKSPACE/src-tauri/gen/apple"
-          APP_PATH=$(find "$APPLE_DIR" -type d -name "*.app" -path "*Debug*" | head -n 1)
+
+          echo "=== Searching for .app bundles ==="
+          find "$APPLE_DIR" -type d -name "*.app" || true
+          echo "=== Searching build directory ==="
+          find "$APPLE_DIR" -type d -name "build" -exec ls -laR {} \; 2>/dev/null || true
+          echo "=== Searching DerivedData ==="
+          find ~/Library/Developer/Xcode/DerivedData -type d -name "*.app" 2>/dev/null || true
+
+          # 尝试多种路径模式来找到 .app
+          APP_PATH=""
+          # 1) 在 gen/apple 的 Debug 目录
+          for candidate in \
+            "$APPLE_DIR/build/Debug-iphoneos/TauriTavern.app" \
+            "$APPLE_DIR/build/Debug/TauriTavern.app" \
+            "$APPLE_DIR/build/Build/Products/Debug-iphoneos/TauriTavern.app" \
+            "$APPLE_DIR/build/Build/Products/Debug/TauriTavern.app"; do
+            if [ -d "$candidate" ]; then
+              APP_PATH="$candidate"
+              break
+            fi
+          done
+
+          # 2) 在 DerivedData 中搜索
+          if [ -z "$APP_PATH" ]; then
+            APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -type d -name "TauriTavern.app" -path "*Debug*" | head -n 1)
+          fi
+
+          # 3) 通用搜索
+          if [ -z "$APP_PATH" ]; then
+            APP_PATH=$(find "$APPLE_DIR" -type d -name "*.app" | head -n 1)
+          fi
+
           if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
-            echo "App bundle not found. All .app dirs:"
-            find "$APPLE_DIR" -type d -name "*.app" || true
-            echo "Build products dirs:"
-            find "$APPLE_DIR" -type d -name "Build" -exec find {} -maxdepth 3 -type d \; || true
+            echo "ERROR: App bundle not found anywhere"
             exit 1
           fi
+
           echo "Found app at: $APP_PATH"
 
           STAGING="$RUNNER_TEMP/ipa-staging"
@@ -121,7 +178,6 @@ jobs:
           mkdir -p "$STAGING/Payload"
           cp -R "$APP_PATH" "$STAGING/Payload/"
 
-          # TrollStore 可识别的未签名 IPA（本质是 Payload/*.app 的 zip）
           IPA="$RUNNER_TEMP/TauriTavern-ios15-unsigned.ipa"
           rm -f "$IPA"
           (cd "$STAGING" && zip -r -y "$IPA" Payload > /dev/null)
